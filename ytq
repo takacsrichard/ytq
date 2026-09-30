@@ -20,7 +20,7 @@ import sys
 from pathlib import Path
 from urllib.parse import urlparse
 
-BASE_DIR = Path.home() / "global_scripts/yt-dlp-ingest"
+BASE_DIR = Path(__file__).resolve().parent
 DB_FILE  = BASE_DIR / "state" / "queue.db"
 PID_FILE = BASE_DIR / "state" / "daemon.pid"
 

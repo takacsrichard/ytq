@@ -13,7 +13,7 @@ import logging
 from pathlib import Path
 
 # ── Config ────────────────────────────────────────────────────────────────────
-BASE_DIR      = Path.home() / "global_scripts/yt-dlp-ingest"
+BASE_DIR      = Path(__file__).resolve().parent
 STATE_DIR     = BASE_DIR / "state"
 DB_FILE       = STATE_DIR / "queue.db"
 PID_FILE      = STATE_DIR / "daemon.pid"
