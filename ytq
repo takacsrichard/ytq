@@ -1,0 +1,242 @@
+#!/usr/bin/env python3
+"""ytq — yt-dlp queue CLI.
+
+Usage:
+  ytq add <url> [url2 ...]    Add URL(s) to the queue
+  ytq add                     Read URLs from stdin (one per line)
+  ytq list                    Show all queue items
+  ytq status                  Show queue statistics
+  ytq remove <id|url> ...     Remove pending item(s) by ID or URL
+  ytq retry                   Requeue all failed downloads
+  ytq clear                   Remove all done/failed entries
+  ytq errors                  Show failed items with error messages
+  ytq watch                   Read URLs from stdin continuously (line by line)
+"""
+
+import os
+import signal
+import sqlite3
+import sys
+from pathlib import Path
+from urllib.parse import urlparse
+
+BASE_DIR = Path.home() / "global_scripts/yt-dlp-ingest"
+DB_FILE  = BASE_DIR / "state" / "queue.db"
+PID_FILE = BASE_DIR / "state" / "daemon.pid"
+
+
+# ── Helpers ────────────────────────────────────────────────────────────────────
+def _conn() -> sqlite3.Connection:
+    if not DB_FILE.exists():
+        print(f"Error: queue DB not found at {DB_FILE}", file=sys.stderr)
+        print("Start the daemon first: systemctl --user start ytdlp-ingest", file=sys.stderr)
+        sys.exit(1)
+    c = sqlite3.connect(DB_FILE, timeout=5)
+    c.row_factory = sqlite3.Row
+    c.execute("PRAGMA journal_mode=WAL")
+    return c
+
+
+def _notify_daemon():
+    """Send SIGUSR1 to the daemon so it polls immediately."""
+    try:
+        pid = int(PID_FILE.read_text().strip())
+        os.kill(pid, signal.SIGUSR1)
+    except (FileNotFoundError, ValueError, ProcessLookupError):
+        pass
+
+
+# ── Commands ───────────────────────────────────────────────────────────────────
+def _is_valid_url(url: str) -> bool:
+    try:
+        p = urlparse(url)
+        return p.scheme in ("http", "https") and bool(p.netloc)
+    except Exception:
+        return False
+
+
+def cmd_add(urls: list[str]):
+    urls = [u.strip() for u in urls if u.strip()]
+    if not urls:
+        print("No URLs provided.")
+        return
+    cwd = os.getcwd()
+    c = _conn()
+    added = skipped = rejected = 0
+    for url in urls:
+        if not _is_valid_url(url):
+            print(f"Rejected (not a valid http/https URL): {url}", file=sys.stderr)
+            rejected += 1
+            continue
+        try:
+            c.execute("INSERT INTO queue (url, cwd) VALUES (?, ?)", (url, cwd))
+            added += 1
+        except sqlite3.IntegrityError:
+            skipped += 1
+    c.commit()
+    c.close()
+    parts = [f"Added: {added}", f"Skipped (duplicate): {skipped}"]
+    if rejected:
+        parts.append(f"Rejected (invalid URL): {rejected}")
+    print("  ".join(parts))
+    if added:
+        _notify_daemon()
+
+
+def cmd_list():
+    c = _conn()
+    rows = c.execute(
+        "SELECT id, status, added_at, url FROM queue ORDER BY id"
+    ).fetchall()
+    c.close()
+    if not rows:
+        print("Queue is empty.")
+        return
+    icons = {"pending": "⏳", "in_progress": "⬇ ", "done": "✅", "failed": "❌"}
+    for r in rows:
+        icon = icons.get(r["status"], "?")
+        short = r["url"][:90] + ("…" if len(r["url"]) > 90 else "")
+        print(f"[{r['id']:4d}] {icon} {r['status']:<12}  {short}")
+
+
+def cmd_status():
+    c = _conn()
+    rows = c.execute("SELECT status, COUNT(*) n FROM queue GROUP BY status").fetchall()
+    c.close()
+    counts = {r["status"]: r["n"] for r in rows}
+    total  = sum(counts.values())
+    print(f"Total:        {total}")
+    for s in ("pending", "in_progress", "done", "failed"):
+        print(f"  {s:<13} {counts.get(s, 0)}")
+
+    # Show daemon status
+    if PID_FILE.exists():
+        try:
+            pid = int(PID_FILE.read_text().strip())
+            os.kill(pid, 0)
+            print(f"\nDaemon: running (PID {pid})")
+        except (ProcessLookupError, PermissionError):
+            print("\nDaemon: PID file stale (not running)")
+    else:
+        print("\nDaemon: not running")
+
+
+def cmd_remove(identifiers: list[str]):
+    c = _conn()
+    removed = 0
+    for ident in identifiers:
+        ident = ident.strip()
+        if not ident:
+            continue
+        if ident.isdigit():
+            cur = c.execute(
+                "DELETE FROM queue WHERE id=? AND status='pending'", (int(ident),)
+            )
+        else:
+            # Try exact URL match first, then substring match (catches video IDs)
+            cur = c.execute(
+                "DELETE FROM queue WHERE url=? AND status='pending'", (ident,)
+            )
+            if cur.rowcount == 0:
+                cur = c.execute(
+                    "DELETE FROM queue WHERE url LIKE ? AND status='pending'",
+                    (f"%{ident}%",)
+                )
+        removed += cur.rowcount
+    c.commit()
+    c.close()
+    print(f"Removed {removed} item(s)  (only 'pending' items can be removed)")
+
+
+def cmd_retry():
+    c = _conn()
+    cur = c.execute(
+        """UPDATE queue SET status='pending', error=NULL,
+           started_at=NULL, finished_at=NULL, retry_count=retry_count+1
+           WHERE status='failed'"""
+    )
+    c.commit()
+    c.close()
+    n = cur.rowcount
+    print(f"Requeued {n} failed item(s)")
+    if n:
+        _notify_daemon()
+
+
+def cmd_clear():
+    c = _conn()
+    cur = c.execute("DELETE FROM queue WHERE status IN ('done', 'failed')")
+    c.commit()
+    c.close()
+    print(f"Cleared {cur.rowcount} completed/failed item(s)")
+
+
+def cmd_errors():
+    c = _conn()
+    rows = c.execute(
+        "SELECT id, url, error FROM queue WHERE status='failed' ORDER BY id"
+    ).fetchall()
+    c.close()
+    if not rows:
+        print("No failed downloads.")
+        return
+    for r in rows:
+        print(f"\n[{r['id']}] {r['url']}")
+        if r["error"]:
+            print(f"       {r['error'][:300]}")
+
+
+def cmd_watch():
+    """Read URLs line-by-line from stdin (interactive or piped), add each immediately."""
+    print("Watching stdin for URLs (Ctrl-D or Ctrl-C to stop)…", file=sys.stderr)
+    try:
+        for line in sys.stdin:
+            url = line.strip()
+            if url:
+                cmd_add([url])
+    except KeyboardInterrupt:
+        print("\nStopped watching.", file=sys.stderr)
+
+
+# ── Entry point ───────────────────────────────────────────────────────────────
+USAGE = __doc__
+
+def main():
+    args = sys.argv[1:]
+    if not args:
+        print(USAGE)
+        sys.exit(0)
+
+    cmd  = args[0]
+    rest = args[1:]
+
+    if cmd == "add":
+        if rest:
+            cmd_add(rest)
+        else:
+            urls = sys.stdin.read().splitlines()
+            cmd_add(urls)
+    elif cmd == "list":
+        cmd_list()
+    elif cmd == "status":
+        cmd_status()
+    elif cmd == "remove":
+        if not rest:
+            print("Error: specify ID or URL to remove.", file=sys.stderr)
+            sys.exit(1)
+        cmd_remove(rest)
+    elif cmd == "retry":
+        cmd_retry()
+    elif cmd == "clear":
+        cmd_clear()
+    elif cmd == "errors":
+        cmd_errors()
+    elif cmd == "watch":
+        cmd_watch()
+    else:
+        print(f"Unknown command: {cmd}\n{USAGE}", file=sys.stderr)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
