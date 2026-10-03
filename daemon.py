@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """yt-dlp queue daemon — polls SQLite queue and downloads with dynamic worker scaling."""
 
+import json
 import os
 import re
 import sys
@@ -71,27 +72,54 @@ def _conn() -> sqlite3.Connection:
     return c
 
 
+def _create_schema(c: sqlite3.Connection):
+    c.executescript("""
+        CREATE TABLE IF NOT EXISTS queue (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            args        TEXT NOT NULL,
+            status      TEXT NOT NULL DEFAULT 'pending',
+            added_at    TEXT DEFAULT (datetime('now')),
+            started_at  TEXT,
+            finished_at TEXT,
+            worker_id   INTEGER,
+            error       TEXT,
+            retry_count INTEGER DEFAULT 0,
+            cwd         TEXT
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_args_unique ON queue(args);
+        CREATE INDEX IF NOT EXISTS idx_status ON queue(status);
+    """)
+
+
 def init_db():
     DB_FILE.parent.mkdir(parents=True, exist_ok=True)
     with _conn() as c:
-        c.executescript("""
-            CREATE TABLE IF NOT EXISTS queue (
-                id          INTEGER PRIMARY KEY AUTOINCREMENT,
-                url         TEXT UNIQUE NOT NULL,
-                status      TEXT NOT NULL DEFAULT 'pending',
-                added_at    TEXT DEFAULT (datetime('now')),
-                started_at  TEXT,
-                finished_at TEXT,
-                worker_id   INTEGER,
-                error       TEXT,
-                retry_count INTEGER DEFAULT 0,
-                cwd         TEXT
-            );
-            CREATE INDEX IF NOT EXISTS idx_status ON queue(status);
-        """)
-        cols = [row["name"] for row in c.execute("PRAGMA table_info(queue)")]
-        if "cwd" not in cols:
-            c.execute("ALTER TABLE queue ADD COLUMN cwd TEXT")
+        exists = c.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='queue'"
+        ).fetchone()
+        cols = [r["name"] for r in c.execute("PRAGMA table_info(queue)")] if exists else []
+
+        if cols and "args" not in cols and "url" in cols:
+            log.warning("Migrating queue schema: url -> args")
+            old_rows = c.execute(
+                "SELECT id, url, status, added_at, started_at, finished_at, "
+                "worker_id, error, retry_count, cwd FROM queue"
+            ).fetchall()
+            c.execute("ALTER TABLE queue RENAME TO queue_old_migrate")
+            _create_schema(c)
+            for r in old_rows:
+                c.execute(
+                    "INSERT INTO queue (id, args, status, added_at, started_at, "
+                    "finished_at, worker_id, error, retry_count, cwd) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?)",
+                    (r["id"], json.dumps([r["url"]]), r["status"], r["added_at"],
+                     r["started_at"], r["finished_at"], r["worker_id"], r["error"],
+                     r["retry_count"], r["cwd"]),
+                )
+            c.execute("DROP TABLE queue_old_migrate")
+            log.info(f"Migrated {len(old_rows)} row(s) to new schema")
+        else:
+            _create_schema(c)
 
 
 def _count_statuses() -> dict:
@@ -101,13 +129,13 @@ def _count_statuses() -> dict:
     return {r["status"]: r["n"] for r in rows}
 
 
-def _claim_next(worker_id: int, generation: int) -> tuple[int, str, str | None] | None:
-    """Atomically claim one pending URL for this worker. Returns (id, url, cwd) or None."""
+def _claim_next(worker_id: int, generation: int) -> tuple[int, list[str], str | None] | None:
+    """Atomically claim one pending job for this worker. Returns (id, args, cwd) or None."""
     with _db_lock:
         c = _conn()
         try:
             row = c.execute(
-                "SELECT id, url, cwd FROM queue WHERE status='pending' ORDER BY id ASC LIMIT 1"
+                "SELECT id, args, cwd FROM queue WHERE status='pending' ORDER BY id ASC LIMIT 1"
             ).fetchone()
             if row is None:
                 return None
@@ -116,7 +144,7 @@ def _claim_next(worker_id: int, generation: int) -> tuple[int, str, str | None] 
                 (worker_id, row["id"]),
             )
             c.commit()
-            return row["id"], row["url"], row["cwd"]
+            return row["id"], json.loads(row["args"]), row["cwd"]
         finally:
             c.close()
 
@@ -179,9 +207,11 @@ def _resolve_target_dir(cwd: str | None) -> Path:
     return FALLBACK_DIR
 
 
-def _run_ytdlp(item_id: int, url: str, cwd: str | None, worker_id: int):
+def _run_ytdlp(item_id: int, args: list[str], cwd: str | None, worker_id: int):
     target_dir = _resolve_target_dir(cwd)
     output_template = str(target_dir / "%(uploader)s/%(title)s [%(id)s].%(ext)s")
+    # ytq's defaults come first, the user's forwarded args come last — yt-dlp
+    # takes the last occurrence of most options, so the user's args win on conflict.
     cmd = [
         YTDLP_BIN,
         "-N", "4",
@@ -190,9 +220,10 @@ def _run_ytdlp(item_id: int, url: str, cwd: str | None, worker_id: int):
         "--no-colors",
         "--newline",
         "--progress",
-        url,
+        *args,
     ]
-    log.info(f"[W{worker_id}] START {url} -> {target_dir}")
+    label = " ".join(args)
+    log.info(f"[W{worker_id}] START {label} -> {target_dir}")
 
     output_lines: list[str] = []
     already_downloaded = False
@@ -200,6 +231,7 @@ def _run_ytdlp(item_id: int, url: str, cwd: str | None, worker_id: int):
     try:
         proc = subprocess.Popen(
             cmd,
+            cwd=str(target_dir),
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
@@ -225,19 +257,19 @@ def _run_ytdlp(item_id: int, url: str, cwd: str | None, worker_id: int):
 
         if already_downloaded or rc == 0:
             if already_downloaded:
-                log.info(f"[W{worker_id}] ALREADY DOWNLOADED {url}")
+                log.info(f"[W{worker_id}] ALREADY DOWNLOADED {label}")
                 _mark_already_downloaded(item_id)
             else:
-                log.info(f"[W{worker_id}] DONE {url}")
+                log.info(f"[W{worker_id}] DONE {label}")
                 _mark_done(item_id)
         else:
             tail = "\n".join(output_lines[-15:])
-            log.error(f"[W{worker_id}] FAILED rc={rc} {url}")
+            log.error(f"[W{worker_id}] FAILED rc={rc} {label}")
             _clean_part_files(target_dir)
             _mark_failed(item_id, f"rc={rc}\n{tail}")
 
     except Exception as exc:
-        log.exception(f"[W{worker_id}] EXCEPTION downloading {url}: {exc}")
+        log.exception(f"[W{worker_id}] EXCEPTION running {label}: {exc}")
         _clean_part_files(target_dir)
         _mark_failed(item_id, str(exc))
 
@@ -258,8 +290,8 @@ def _worker(worker_id: int, my_generation: int):
             _shutdown.wait(WORKER_IDLE_SLEEP)
             continue
 
-        item_id, url, cwd = result
-        _run_ytdlp(item_id, url, cwd, worker_id)
+        item_id, args, cwd = result
+        _run_ytdlp(item_id, args, cwd, worker_id)
 
     log.info(f"Worker {worker_id} exiting (gen={my_generation})")
 

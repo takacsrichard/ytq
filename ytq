@@ -1,28 +1,41 @@
 #!/usr/bin/env python3
 """ytq — yt-dlp queue CLI.
 
+ytq is a thin queue wrapper around yt-dlp: whatever you'd normally pass to
+`yt-dlp` you pass to `ytq`, and it gets queued and run later by the daemon
+with your args forwarded as-is (on top of ytq's own defaults — concurrency,
+download archive, output template — which your args may override).
+
 Usage:
-  ytq add <url> [url2 ...]    Add URL(s) to the queue
-  ytq add <file> [...]        Read URLs from a file (one per line)
+  ytq <yt-dlp args...>        Queue a yt-dlp invocation, e.g.:
+                                 ytq "https://youtu.be/XYZ"
+                                 ytq "ytsearch1:some song" -f bestaudio
+  ytq <file>                  Batch file: one job per line (each line is
+                               split like a shell command, so lines may
+                               include flags). Lines starting with # are
+                               skipped.
   ytq list                    Show all queue items
   ytq status                  Show queue statistics
-  ytq remove <id|url> ...     Remove pending item(s) by ID or URL
+  ytq remove <id|substring> ...  Remove pending item(s) by ID or text match
   ytq retry                   Requeue all failed downloads
   ytq clear                   Remove all done/failed entries
   ytq errors                  Show failed items with error messages
-  ytq watch                   Read URLs from stdin continuously (line by line)
+  ytq watch                   Read invocations from stdin continuously (line by line)
 """
 
+import json
 import os
+import shlex
 import signal
 import sqlite3
 import sys
 from pathlib import Path
-from urllib.parse import urlparse
 
 BASE_DIR = Path(__file__).resolve().parent
 DB_FILE  = BASE_DIR / "state" / "queue.db"
 PID_FILE = BASE_DIR / "state" / "daemon.pid"
+
+RESERVED = {"list", "status", "remove", "retry", "clear", "errors", "watch"}
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
@@ -46,53 +59,44 @@ def _notify_daemon():
         pass
 
 
+def _display(args_json: str, width: int = 90) -> str:
+    text = " ".join(json.loads(args_json))
+    return text[:width] + ("…" if len(text) > width else "")
+
+
 # ── Commands ───────────────────────────────────────────────────────────────────
-def _is_valid_url(url: str) -> bool:
-    try:
-        p = urlparse(url)
-        return p.scheme in ("http", "https") and bool(p.netloc)
-    except Exception:
-        return False
+def _jobs_from_args(args: list[str]) -> list[list[str]]:
+    """A single bare file path is treated as a batch file: each non-empty,
+    non-comment line becomes its own job (like yt-dlp's -a/--batch-file),
+    split with shlex so a line may carry its own flags. Otherwise the whole
+    argument list is one job, exactly as if you'd called yt-dlp directly."""
+    if len(args) == 1 and not args[0].startswith("-") and Path(args[0]).is_file():
+        jobs = []
+        for line in Path(args[0]).read_text().splitlines():
+            line = line.strip()
+            if line and not line.startswith("#"):
+                jobs.append(shlex.split(line))
+        return jobs
+    return [args]
 
 
-def _expand_args(args: list[str]) -> list[str]:
-    """Expand any args that are paths to existing files into the URLs they contain
-    (one per line), like yt-dlp's -a/--batch-file. Non-file args pass through as-is."""
-    urls = []
-    for arg in args:
-        p = Path(arg)
-        if not _is_valid_url(arg) and p.is_file():
-            urls.extend(line.strip() for line in p.read_text().splitlines())
-        else:
-            urls.append(arg)
-    return urls
-
-
-def cmd_add(urls: list[str]):
-    urls = _expand_args(urls)
-    urls = [u.strip() for u in urls if u.strip()]
-    if not urls:
-        print("No URLs provided.")
+def cmd_enqueue(args: list[str]):
+    jobs = [j for j in _jobs_from_args(args) if j]
+    if not jobs:
+        print("No jobs to add.")
         return
     cwd = os.getcwd()
     c = _conn()
-    added = skipped = rejected = 0
-    for url in urls:
-        if not _is_valid_url(url):
-            print(f"Rejected (not a valid http/https URL): {url}", file=sys.stderr)
-            rejected += 1
-            continue
+    added = skipped = 0
+    for job in jobs:
         try:
-            c.execute("INSERT INTO queue (url, cwd) VALUES (?, ?)", (url, cwd))
+            c.execute("INSERT INTO queue (args, cwd) VALUES (?, ?)", (json.dumps(job), cwd))
             added += 1
         except sqlite3.IntegrityError:
             skipped += 1
     c.commit()
     c.close()
-    parts = [f"Added: {added}", f"Skipped (duplicate): {skipped}"]
-    if rejected:
-        parts.append(f"Rejected (invalid URL): {rejected}")
-    print("  ".join(parts))
+    print(f"Added: {added}  Skipped (duplicate): {skipped}")
     if added:
         _notify_daemon()
 
@@ -100,7 +104,7 @@ def cmd_add(urls: list[str]):
 def cmd_list():
     c = _conn()
     rows = c.execute(
-        "SELECT id, status, added_at, url FROM queue ORDER BY id"
+        "SELECT id, status, added_at, args FROM queue ORDER BY id"
     ).fetchall()
     c.close()
     if not rows:
@@ -109,8 +113,7 @@ def cmd_list():
     icons = {"pending": "⏳", "in_progress": "⬇ ", "done": "✅", "failed": "❌"}
     for r in rows:
         icon = icons.get(r["status"], "?")
-        short = r["url"][:90] + ("…" if len(r["url"]) > 90 else "")
-        print(f"[{r['id']:4d}] {icon} {r['status']:<12}  {short}")
+        print(f"[{r['id']:4d}] {icon} {r['status']:<12}  {_display(r['args'])}")
 
 
 def cmd_status():
@@ -147,15 +150,10 @@ def cmd_remove(identifiers: list[str]):
                 "DELETE FROM queue WHERE id=? AND status='pending'", (int(ident),)
             )
         else:
-            # Try exact URL match first, then substring match (catches video IDs)
             cur = c.execute(
-                "DELETE FROM queue WHERE url=? AND status='pending'", (ident,)
+                "DELETE FROM queue WHERE args LIKE ? AND status='pending'",
+                (f"%{ident}%",)
             )
-            if cur.rowcount == 0:
-                cur = c.execute(
-                    "DELETE FROM queue WHERE url LIKE ? AND status='pending'",
-                    (f"%{ident}%",)
-                )
         removed += cur.rowcount
     c.commit()
     c.close()
@@ -188,26 +186,26 @@ def cmd_clear():
 def cmd_errors():
     c = _conn()
     rows = c.execute(
-        "SELECT id, url, error FROM queue WHERE status='failed' ORDER BY id"
+        "SELECT id, args, error FROM queue WHERE status='failed' ORDER BY id"
     ).fetchall()
     c.close()
     if not rows:
         print("No failed downloads.")
         return
     for r in rows:
-        print(f"\n[{r['id']}] {r['url']}")
+        print(f"\n[{r['id']}] {_display(r['args'])}")
         if r["error"]:
             print(f"       {r['error'][:300]}")
 
 
 def cmd_watch():
-    """Read URLs line-by-line from stdin (interactive or piped), add each immediately."""
-    print("Watching stdin for URLs (Ctrl-D or Ctrl-C to stop)…", file=sys.stderr)
+    """Read yt-dlp invocations line-by-line from stdin, add each immediately."""
+    print("Watching stdin for yt-dlp invocations (Ctrl-D or Ctrl-C to stop)…", file=sys.stderr)
     try:
         for line in sys.stdin:
-            url = line.strip()
-            if url:
-                cmd_add([url])
+            line = line.strip()
+            if line:
+                cmd_enqueue(shlex.split(line))
     except KeyboardInterrupt:
         print("\nStopped watching.", file=sys.stderr)
 
@@ -224,18 +222,18 @@ def main():
     cmd  = args[0]
     rest = args[1:]
 
-    if cmd == "add":
-        if not rest:
-            print("Error: specify URL(s) or file(s) to add.", file=sys.stderr)
-            sys.exit(1)
-        cmd_add(rest)
-    elif cmd == "list":
+    if cmd not in RESERVED:
+        # Bare passthrough: the whole argv is a yt-dlp invocation to enqueue.
+        cmd_enqueue(args)
+        return
+
+    if cmd == "list":
         cmd_list()
     elif cmd == "status":
         cmd_status()
     elif cmd == "remove":
         if not rest:
-            print("Error: specify ID or URL to remove.", file=sys.stderr)
+            print("Error: specify ID or text to match for removal.", file=sys.stderr)
             sys.exit(1)
         cmd_remove(rest)
     elif cmd == "retry":
@@ -246,9 +244,6 @@ def main():
         cmd_errors()
     elif cmd == "watch":
         cmd_watch()
-    else:
-        print(f"Unknown command: {cmd}\n{USAGE}", file=sys.stderr)
-        sys.exit(1)
 
 
 if __name__ == "__main__":
